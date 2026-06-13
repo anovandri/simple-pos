@@ -1,0 +1,31 @@
+name: simple_bluetooth_pos
+description: A minimal POS app with Bluetooth thermal printer support.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  print_bluetooth_thermal: ^1.1.6
+  esc_pos_utils_plus: ^2.0.4
+  permission_handler: ^11.3.1
+  shared_preferences: ^2.2.3
+  path_provider: ^2.1.5
+  share_plus: ^10.0.2
+  image: ^4.2.0
+  thermal_printer: ^1.0.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.2
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/store_logo.png
+    - assets/data/default_menu_catalog.txt

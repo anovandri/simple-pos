@@ -1,0 +1,56 @@
+1. Mango Juice ; 15000 ; drink
+2. Avocado Juice ; 15000 ; drink
+3. Straberry Juice ; 15000 ; drink
+4. Apple Juice ; 15000 ; drink
+5. Guava Juice ; 15000 ; drink
+6. Tomato Juice ; 15000 ; drink
+7. Dragon Fruit Juice ; 15000 ; drink
+8. Banana Juice ; 15000 ; drink
+9. Watermelon Juice ; 15000 ; drink
+10. Sirsak Juice ; 15000 ; drink
+11. Mango Smoothie ; 25000 ; drink
+12. Avocado Smoothie ; 25000 ; drink
+13. Strawberry Smoothie ; 25000 ; drink
+14. Guava Smoothie ; 25000 ; drink
+15. Dragon Fruit Smoothie ; 25000 ; drink
+16. Banana Smoothie ; 25000 ; drink
+17. Watermelom Smoothie ; 25000 ; drink
+18. Sirsak Smoothie ; 25000 ; drink
+19. Avocado Coffee Smoothie ; 29000 ; drink
+20. Banana Coffee Smoothie ; 29000 ; drink
+21. Oreo Coffee Smoothie ; 29000 ; drink
+22. Avocado Vanilla Cream ; 27000 ; drink
+23. Banana Vanilla Cream ; 27000 ; drink
+24. Mango Vanilla Cream ; 27000 ; drink
+25. Strawberry Vanilla Cream ; 27000 ; drink
+26. Oreo Vanilla Frappe ; 27000 ; drink
+27. Almond Avocado Smoothie ; 29000 ; drink
+28. Almond Banana Smoothie ; 29000 ; drink
+29. Oreo Almond Frappe ; 30000 ; drink
+30. Banana Almond Coffee ; 30000 ; drink
+31. Avocado Almond Coffee ; 30000 ; drink
+32. Mango Banana Juice ; 15000 ; drink
+33. Strawberry Banana Juice ; 15000 ; drink
+34. Dragon Strawberry Juice ; 15000 ; drink
+35. Mango Strawberry Juice ; 15000 ; drink
+36. Mango Banana Smoothie ; 25000 ; drink
+37. Strawberry Banana Smoothie ; 25000 ; drink
+38. Dragon Strawberry Smoothie ; 25000 ; drink
+39. Mango Strawberry Smoothie ; 25000 ; drink
+40. Es Teh Manis ; 8000 ; drink
+41. Teh Manis Hangat ; 6000 ; drink
+42. Pisang Goreng ; 10000 ; Food
+43. Pisang Goreng Keju ; 15000 ; Food
+44. Pisang Goreng Matcha ; 15000 ; Food
+45. Pisang Goreng Hazelnut ; 15000 ; Food
+46. French Fries ; 15000 ; Food
+47. Sosis ; 6000 ; Food
+48. Siomay ; 18000 ; Food
+49. Roti Bakar Meses ; 10000 ; Food
+50. Roti Bakar Keju Susu ; 15000 ; Food
+51. Roti Bakar Mozarella ; 15000 ; Food
+52. Roti Bakar Matcha ; 15000 ; Food
+53. Roti Bakar Matcha Crunchy ; 15000 ; Food
+54. Roti Bakar Hazelnut ; 15000 ; Food
+55. Risoles Mayo ; 15000 ; Food
+56. Snack ; 10000 ; Food
