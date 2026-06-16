@@ -9,6 +9,7 @@ import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:print_bluetooth_thermal/print_bluetooth_thermal.dart';
+import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:thermal_printer/thermal_printer.dart' as thermal;
@@ -89,6 +90,13 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
   final _wifiNameController = TextEditingController();
   final _wifiPasswordController = TextEditingController();
   final _promoDiscountPercentController = TextEditingController(text: '10');
+  final _testPrinterTextController = TextEditingController(
+    text: 'Test Print\nHello World!\n\nThis is a printer test.',
+  );
+
+  // Printer protocol for testing (ESC/POS vs TSPL)
+  String _testPrinterProtocol = 'ESCPOS'; // 'ESCPOS', 'TSPL', 'CPCL'
+
   final _productStorage = ProductStorage();
   final _transactionStorage = TransactionStorage();
   final _orderTicketStorage = OrderTicketStorage();
@@ -127,6 +135,12 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
   _PrinterConnectionMode _labelPrinterConnectionMode =
       _PrinterConnectionMode.bluetooth;
 
+  // Dual Bluetooth connection state (flutter_bluetooth_serial for simultaneous connections)
+  BluetoothConnection? _invoiceBluetoothConnection;
+  BluetoothConnection? _labelBluetoothConnection;
+  bool _isInvoiceBluetoothConnecting = false;
+  bool _isLabelBluetoothConnecting = false;
+
   // Shared USB scanning state (reused for both invoice and label scanning)
   bool _isUsbScanInProgress = false;
   StreamSubscription<thermal.PrinterDevice>? _usbDiscoverySubscription;
@@ -142,11 +156,13 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
   Product? _selectedCatalogProduct;
   final List<ReceiptItem> _items = [];
   List<_PromoConfig> _promoConfigs = [];
+
   List<OrderTicket> _incomingOrders = [];
   List<PosTransaction> _transactions = [];
   List<String> _syncCsvHistory = [];
   bool _isBluetoothPermissionGranted = false;
   PaperSize _selectedPaperSize = PaperSize.mm58;
+  bool _useRawPrintMode = false; // For CT221B compatibility testing
   String _selectedPaymentMethod = 'Cash';
   String _selectedProductCategory = 'Drinks';
   String _selectedPromoCategory = 'Drinks';
@@ -277,6 +293,180 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
     }
   }
 
+  // Dual-Bluetooth connection helpers
+  BluetoothConnection? _getBluetoothConnection(_PrinterType printerType) =>
+      printerType == _PrinterType.invoice
+          ? _invoiceBluetoothConnection
+          : _labelBluetoothConnection;
+
+  void _setBluetoothConnection(
+      _PrinterType printerType, BluetoothConnection? connection) {
+    if (printerType == _PrinterType.invoice) {
+      _invoiceBluetoothConnection = connection;
+    } else {
+      _labelBluetoothConnection = connection;
+    }
+  }
+
+  bool _isBluetoothConnected(_PrinterType printerType) {
+    final connection = _getBluetoothConnection(printerType);
+    return connection != null && connection.isConnected;
+  }
+
+  Future<void> _disconnectBluetoothPrinter(
+    _PrinterType printerType, {
+    bool showMessage = true,
+  }) async {
+    try {
+      final connection = _getBluetoothConnection(printerType);
+      if (connection != null && connection.isConnected) {
+        await connection.close();
+        _setBluetoothConnection(printerType, null);
+      }
+      if (printerType == _PrinterType.invoice) {
+        _isInvoicePrinterConnected = false;
+      } else {
+        _isLabelPrinterConnected = false;
+      }
+      if (showMessage) {
+        final printerName = printerType == _PrinterType.invoice
+            ? 'Invoice printer'
+            : 'Label printer';
+        _showMessage('$printerName disconnected.');
+      }
+    } catch (error) {
+      debugPrint(
+          'Error disconnecting ${printerType.code} Bluetooth printer: $error');
+    }
+  }
+
+  Future<bool> _connectBluetoothPrinter(
+    _PrinterType printerType, {
+    bool showMessage = true,
+  }) async {
+    final printerLabel =
+        printerType == _PrinterType.invoice ? 'INVOICE' : 'LABEL';
+    debugPrint('===== Connect Bluetooth Printer =====');
+    debugPrint('Printer type: $printerLabel');
+
+    if (_isBluetoothConnecting(printerType)) {
+      debugPrint('Connection already in progress for $printerLabel');
+      if (showMessage) {
+        final printerName =
+            printerType == _PrinterType.invoice ? 'Invoice' : 'Label';
+        _showMessage('$printerName printer connection in progress...');
+      }
+      return false;
+    }
+
+    final selectedPrinter = _selectedPrinterForType(printerType);
+    debugPrint('Selected printer: ${selectedPrinter?.name ?? 'NONE'}');
+    debugPrint('Selected printer MAC: ${selectedPrinter?.macAdress ?? 'NONE'}');
+
+    if (selectedPrinter == null) {
+      debugPrint('No printer selected for $printerLabel!');
+      if (showMessage) {
+        final printerName =
+            printerType == _PrinterType.invoice ? 'Invoice' : 'Label';
+        _showMessage('Select a $printerName printer first.');
+      }
+      return false;
+    }
+
+    // Check if already connected to the same printer
+    final existingConnection = _getBluetoothConnection(printerType);
+    if (existingConnection != null && existingConnection.isConnected) {
+      debugPrint('Already connected to $printerLabel printer!');
+      // Already connected, no need to reconnect
+      if (showMessage) {
+        final printerName =
+            printerType == _PrinterType.invoice ? 'Invoice' : 'Label';
+        _showMessage('$printerName printer already connected.');
+      }
+      return true;
+    }
+
+    _setBluetoothConnecting(printerType, true);
+
+    try {
+      debugPrint('Disconnecting any existing connection...');
+      // Disconnect any existing connection for this printer
+      await _disconnectBluetoothPrinter(printerType, showMessage: false);
+
+      debugPrint(
+          'Establishing new connection to ${selectedPrinter.macAdress}...');
+      // Establish new connection
+      final connection = await BluetoothConnection.toAddress(
+        selectedPrinter.macAdress,
+      );
+
+      debugPrint('Connection established, checking status...');
+      debugPrint('Connection.isConnected: ${connection.isConnected}');
+
+      if (connection.isConnected) {
+        debugPrint('Setting connection for $printerLabel...');
+        _setBluetoothConnection(printerType, connection);
+        if (printerType == _PrinterType.invoice) {
+          _isInvoicePrinterConnected = true;
+        } else {
+          _isLabelPrinterConnected = true;
+        }
+
+        if (mounted) {
+          setState(() {});
+        }
+
+        debugPrint('$printerLabel printer connected successfully!');
+        if (showMessage) {
+          final printerName =
+              printerType == _PrinterType.invoice ? 'Invoice' : 'Label';
+          _showMessage(
+              '$printerName printer connected to ${selectedPrinter.name}.');
+        }
+        return true;
+      } else {
+        debugPrint('Connection established but isConnected is false!');
+      }
+    } catch (error) {
+      debugPrint('Connection error for $printerLabel: $error');
+      debugPrint('Error type: ${error.runtimeType}');
+      if (mounted) {
+        setState(() {
+          if (printerType == _PrinterType.invoice) {
+            _isInvoicePrinterConnected = false;
+          } else {
+            _isLabelPrinterConnected = false;
+          }
+        });
+      }
+      if (showMessage) {
+        final printerName =
+            printerType == _PrinterType.invoice ? 'Invoice' : 'Label';
+        final reason = _truncateDebugText(error.toString(), maxLength: 80);
+        _showMessage('$printerName printer connection failed: $reason');
+      }
+      debugPrint('Bluetooth connection error: $error');
+    } finally {
+      _setBluetoothConnecting(printerType, false);
+    }
+
+    debugPrint('Connection failed for $printerLabel');
+    return false;
+  }
+
+  bool _isBluetoothConnecting(_PrinterType printerType) =>
+      printerType == _PrinterType.invoice
+          ? _isInvoiceBluetoothConnecting
+          : _isLabelBluetoothConnecting;
+
+  void _setBluetoothConnecting(_PrinterType printerType, bool value) {
+    if (printerType == _PrinterType.invoice) {
+      _isInvoiceBluetoothConnecting = value;
+    } else {
+      _isLabelBluetoothConnecting = value;
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -338,7 +528,13 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
     _wifiNameController.dispose();
     _wifiPasswordController.dispose();
     _promoDiscountPercentController.dispose();
+    _testPrinterTextController.dispose();
     _usbDiscoverySubscription?.cancel();
+
+    // Clean up Bluetooth connections
+    _invoiceBluetoothConnection?.dispose();
+    _labelBluetoothConnection?.dispose();
+
     super.dispose();
   }
 
@@ -383,6 +579,9 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {
       _printerConnectionMode = resolved;
+      // Initialize dual-printer modes with the same value
+      _invoicePrinterConnectionMode = resolved;
+      _labelPrinterConnectionMode = resolved;
     });
   }
 
@@ -404,6 +603,9 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {
       _printerConnectionMode = mode;
+      // Also update dual-printer mode variables
+      _invoicePrinterConnectionMode = mode;
+      _labelPrinterConnectionMode = mode;
       if (mode == _PrinterConnectionMode.bluetooth) {
         _usbNeedsRecoveryAfterResume = false;
       }
@@ -476,11 +678,23 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
     final resolvedSelection =
         _resolveBluetoothSelection(_selectedPrinter, devices);
 
+    // Resolve selections for both invoice and label printers
+    final invoiceResolvedSelection =
+        _resolveBluetoothSelection(_invoiceSelectedPrinter, devices);
+    final labelResolvedSelection =
+        _resolveBluetoothSelection(_labelSelectedPrinter, devices);
+
     if (!mounted) return;
     setState(() {
       _pairedDevices = devices;
+      // Populate both printer type lists with the same paired devices
+      _invoicePairedDevices = devices;
+      _labelPairedDevices = devices;
       _isPrinterConnected = connected;
       _selectedPrinter = resolvedSelection;
+      // Set resolved selections for both printers
+      _invoiceSelectedPrinter = invoiceResolvedSelection;
+      _labelSelectedPrinter = labelResolvedSelection;
     });
   }
 
@@ -1735,15 +1949,22 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
     );
   }
 
-  Future<bool> _ensurePrinterReadyForPrint() async {
-    if (_printerConnectionMode == _PrinterConnectionMode.usb) {
+  Future<bool> _ensurePrinterReadyForPrint({
+    _PrinterType printerType = _PrinterType.invoice,
+  }) async {
+    // Use printer-type-specific mode instead of legacy single mode
+    final printerMode = _printerModeForType(printerType);
+
+    if (printerMode == _PrinterConnectionMode.usb) {
       return _ensureUsbPrinterReadyForPrint();
     }
 
-    return _ensureBluetoothPrinterReadyForPrint();
+    return _ensureBluetoothPrinterReadyForPrint(printerType: printerType);
   }
 
-  Future<bool> _ensureBluetoothPrinterReadyForPrint() async {
+  Future<bool> _ensureBluetoothPrinterReadyForPrint({
+    _PrinterType printerType = _PrinterType.invoice,
+  }) async {
     if (_isUsbScanInProgress) {
       await _stopUsbDiscovery();
     }
@@ -1754,21 +1975,39 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
       return false;
     }
 
-    if (_selectedPrinter == null) {
+    // Get the correct printer selection based on printer type
+    final selectedPrinter = _selectedPrinterForType(printerType);
+
+    if (selectedPrinter == null) {
       await _loadPairedPrinters(showMessage: false);
     }
 
-    if (_selectedPrinter == null) {
-      _showMessage('Select a paired Bluetooth printer in Settings first.');
+    final reloadedPrinter = _selectedPrinterForType(printerType);
+    if (reloadedPrinter == null) {
+      final printerLabel =
+          printerType == _PrinterType.invoice ? 'invoice' : 'label';
+      _showMessage(
+        'Select a paired Bluetooth printer for $printerLabel printing in Settings first.',
+      );
       return false;
     }
 
-    // Connect here so any failure is surfaced with a clear message before
-    // bytes are built or the write path is entered.
-    final didConnect = await _tryConnectBluetoothWithRetries();
+    // Check if already connected - if so, no need to reconnect
+    if (_isBluetoothConnected(printerType)) {
+      return true;
+    }
+
+    // Not connected, try to connect
+    final didConnect = await _connectBluetoothPrinter(
+      printerType,
+      showMessage: false,
+    );
+
     if (!didConnect) {
+      final printerLabel =
+          printerType == _PrinterType.invoice ? 'invoice' : 'label';
       _showMessage(
-        'Could not connect to printer. Make sure it is on and in range.',
+        'Could not connect to $printerLabel printer. Make sure it is on and in range.',
       );
     }
     return didConnect;
@@ -1875,7 +2114,9 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
     var step = 'start';
     try {
       step = 'ensure printer ready';
-      final printerReady = await _ensurePrinterReadyForPrint();
+      final printerReady = await _ensurePrinterReadyForPrint(
+        printerType: _PrinterType.invoice,
+      );
       if (!printerReady) {
         _showMessage('Printer is not ready. Please reconnect and try again.');
         return;
@@ -1891,6 +2132,9 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
       step = 'build esc/pos generator';
       final generator = Generator(_selectedPaperSize, profile);
       final bytes = <int>[];
+
+      // Reset line spacing to default (30 dots) for normal invoice printing
+      bytes.addAll([0x1B, 0x32]); // ESC 2 - Set default line spacing (30 dots)
 
       step = 'append logo bytes';
       await _appendLogoToReceiptBytes(bytes, generator);
@@ -2006,14 +2250,14 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
       return;
     }
 
-    final printerReady = await _ensurePrinterReadyForPrint();
+    final printerReady = await _ensurePrinterReadyForPrint(
+      printerType: _PrinterType.label,
+    );
     if (!printerReady) {
       _showMessage('Printer is not ready. Please reconnect and try again.');
       return;
     }
 
-    final profile = await CapabilityProfile.load();
-    final generator = Generator(_selectedPaperSize, profile);
     final bytes = <int>[];
 
     void appendProductLabel({
@@ -2022,73 +2266,54 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
       required int copyIndex,
       required int totalCopies,
     }) {
+      // TSPL commands for CT221B-76E6 label printer
+      // Use smaller label size and offset to prevent blank scrolling
+      bytes.addAll('SIZE 70 mm, 30 mm\r\n'.codeUnits);
+      bytes.addAll('GAP 2 mm, 0 mm\r\n'.codeUnits);
+
+      // CRITICAL: OFFSET command prevents blank scrolling before print
+      bytes.addAll('OFFSET 0 mm\r\n'.codeUnits);
+
+      bytes.addAll('DIRECTION 1\r\n'.codeUnits);
+      bytes.addAll('CLS\r\n'.codeUnits);
+
+      // Set reference point to 0,0 to prevent offset scrolling
+      bytes.addAll('REFERENCE 0,0\r\n'.codeUnits);
+
+      // Set density (darkness) for better print quality
+      bytes.addAll('DENSITY 8\r\n'.codeUnits);
+
+      // Order number (start at top with moderate margin)
       bytes.addAll(
-        generator.text(
-          'ORDER READY',
-          styles: const PosStyles(
-            align: PosAlign.center,
-            width: PosTextSize.size1,
-            height: PosTextSize.size1,
-            bold: true,
-          ),
-        ),
-      );
-      bytes.addAll(
-        generator.text(
-          'Order #${order.orderNumber}',
-          styles: const PosStyles(
-            align: PosAlign.center,
-            width: PosTextSize.size1,
-            height: PosTextSize.size1,
-            bold: true,
-          ),
-        ),
-      );
-      bytes.addAll(
-        generator.text(
-          _sanitizePrinterText(order.customerName),
-          styles: const PosStyles(
-            align: PosAlign.center,
-            width: PosTextSize.size1,
-            height: PosTextSize.size1,
-            bold: true,
-          ),
-        ),
-      );
-      bytes.addAll(
-        generator.text(
-          _sanitizePrinterText(productName),
-          styles: const PosStyles(
-            align: PosAlign.center,
-            width: PosTextSize.size1,
-            height: PosTextSize.size1,
-            bold: true,
-          ),
-        ),
-      );
+          'TEXT 30,20,"4",0,1,2,"Order #${order.orderNumber}"\r\n'.codeUnits);
+
+      // Customer name
+      final sanitizedCustomer = _sanitizePrinterText(order.customerName);
+      bytes.addAll('TEXT 30,70,"3",0,1,1,"$sanitizedCustomer"\r\n'.codeUnits);
+
+      // Product name (most important - larger font)
+      final sanitizedProduct = _sanitizePrinterText(productName);
+      bytes.addAll('TEXT 30,105,"4",0,1,2,"$sanitizedProduct"\r\n'.codeUnits);
+
+      var yPos = 155;
+
+      // Item note if present
       final normalizedNote = itemNote.trim();
       if (normalizedNote.isNotEmpty) {
-        bytes.addAll(
-          generator.text(
-            _sanitizePrinterText('Note: $normalizedNote'),
-            styles: const PosStyles(
-              align: PosAlign.center,
-              width: PosTextSize.size1,
-              height: PosTextSize.size1,
-            ),
-          ),
-        );
+        final sanitizedNote = _sanitizePrinterText('Note: $normalizedNote');
+        bytes.addAll('TEXT 30,$yPos,"3",0,1,1,"$sanitizedNote"\r\n'.codeUnits);
+        yPos += 25;
       }
+
+      // Copy indicator if multiple copies
       if (totalCopies > 1) {
         bytes.addAll(
-          generator.text(
-            'Cup ${copyIndex + 1}/$totalCopies',
-            styles: const PosStyles(align: PosAlign.center),
-          ),
-        );
+            'TEXT 30,$yPos,"3",0,1,1,"Cup ${copyIndex + 1}/$totalCopies"\r\n'
+                .codeUnits);
       }
-      bytes.addAll(generator.emptyLines(1));
-      bytes.addAll(generator.cut());
+
+      // Print the label
+      bytes.addAll('PRINT 1,1\r\n'.codeUnits);
     }
 
     if (order.items.isEmpty) {
@@ -2212,44 +2437,119 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
       }
     }
 
-    // Bluetooth path — connection was established by _ensurePrinterReadyForPrint.
-    // Write attempt 0: socket is already connected.
-    // Write attempt 1: reconnect first (socket may have gone stale).
-    // Note: Bluetooth write uses legacy PrintBluetoothThermal library which
-    // manages a single connection. For true dual-printer support with Bluetooth,
-    // additional libraries or native platform code would be needed.
-    for (var attempt = 0; attempt < 2; attempt++) {
-      if (attempt == 1) {
-        // Stale socket — disconnect cleanly and reconnect once before retrying.
-        try {
-          await PrintBluetoothThermal.disconnect;
-        } catch (_) {}
-        await Future<void>.delayed(const Duration(milliseconds: 400));
-        final didReconnect = await _tryConnectBluetoothWithRetries();
-        if (!didReconnect) break;
-        await Future<void>.delayed(const Duration(milliseconds: 700));
-      }
+    // Bluetooth path — now supports true simultaneous dual connections using flutter_bluetooth_serial
+    // Each printer maintains its own independent BluetoothConnection
+    final connection = _getBluetoothConnection(printerType);
 
-      try {
-        final didWrite = await PrintBluetoothThermal.writeBytes(bytes);
-        if (didWrite) {
-          if (mounted) {
-            setState(() => _setBtConnected(printerType, true));
-          }
-          return true;
+    debugPrint('===== Bluetooth Write Debug =====');
+    debugPrint(
+        'Printer type: ${printerType == _PrinterType.invoice ? 'INVOICE' : 'LABEL'}');
+    debugPrint('Connection exists: ${connection != null}');
+    debugPrint('Connection is connected: ${connection?.isConnected ?? false}');
+    debugPrint('Bytes to send: ${bytes.length}');
+
+    if (connection == null || !connection.isConnected) {
+      debugPrint('Connection not ready, attempting to connect...');
+      // Try to establish connection if not already connected
+      final connected = await _connectBluetoothPrinter(
+        printerType,
+        showMessage: false,
+      );
+      debugPrint('Connection attempt result: $connected');
+      if (!connected) {
+        debugPrint('Connection failed!');
+        if (mounted) {
+          setState(() {
+            if (printerType == _PrinterType.invoice) {
+              _isInvoicePrinterConnected = false;
+            } else {
+              _isLabelPrinterConnected = false;
+            }
+          });
         }
-        debugPrint('BT writeBytes returned false on attempt #${attempt + 1}');
-      } catch (error) {
-        debugPrint('BT write attempt #${attempt + 1} threw: $error');
+        return false;
       }
     }
 
-    if (mounted) {
-      setState(() {
-        _setBtConnected(printerType, false);
-      });
+    // Write bytes to the printer's connection
+    try {
+      final activeConnection = _getBluetoothConnection(printerType);
+      if (activeConnection == null || !activeConnection.isConnected) {
+        debugPrint(
+            'ERROR: Active connection not ready after connection attempt!');
+        return false;
+      }
+
+      // For CT221B label printer, add a small delay to ensure it's ready
+      if (printerType == _PrinterType.label) {
+        debugPrint('Adding delay for label printer (CT221B)...');
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+
+      debugPrint('Sending bytes to printer...');
+      // Convert List<int> to Uint8List for Bluetooth transmission
+      final uint8Bytes = Uint8List.fromList(bytes);
+      activeConnection.output.add(uint8Bytes);
+      await activeConnection.output.allSent;
+      debugPrint('Bytes sent successfully!');
+
+      // For CT221B, add extra delay after send to ensure processing
+      if (printerType == _PrinterType.label) {
+        debugPrint('Waiting for label printer to process...');
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+
+      if (mounted) {
+        setState(() {
+          if (printerType == _PrinterType.invoice) {
+            _isInvoicePrinterConnected = true;
+          } else {
+            _isLabelPrinterConnected = true;
+          }
+        });
+      }
+      return true;
+    } catch (error) {
+      debugPrint('Bluetooth write error: $error');
+      debugPrint('Error type: ${error.runtimeType}');
+      if (mounted) {
+        setState(() {
+          if (printerType == _PrinterType.invoice) {
+            _isInvoicePrinterConnected = false;
+          } else {
+            _isLabelPrinterConnected = false;
+          }
+        });
+      }
+
+      // Try one reconnect attempt
+      debugPrint('Attempting reconnect and retry...');
+      try {
+        await _disconnectBluetoothPrinter(printerType, showMessage: false);
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        final reconnected = await _connectBluetoothPrinter(
+          printerType,
+          showMessage: false,
+        );
+        debugPrint('Reconnect result: $reconnected');
+        if (reconnected) {
+          final retryConnection = _getBluetoothConnection(printerType);
+          if (retryConnection != null && retryConnection.isConnected) {
+            debugPrint('Retrying write after reconnect...');
+            final uint8Bytes = Uint8List.fromList(bytes);
+            retryConnection.output.add(uint8Bytes);
+            await retryConnection.output.allSent;
+            debugPrint('Retry successful!');
+            return true;
+          }
+        }
+      } catch (retryError) {
+        debugPrint('Bluetooth retry failed: $retryError');
+        debugPrint('Retry error type: ${retryError.runtimeType}');
+      }
+
+      return false;
     }
-    return false;
   }
 
   Future<void> _appendLogoToReceiptBytes(
@@ -2644,6 +2944,291 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _testPrint(_PrinterType printerType) async {
+    final printerLabel =
+        printerType == _PrinterType.invoice ? 'invoice' : 'label';
+
+    try {
+      // Ensure printer is ready
+      final printerReady = await _ensurePrinterReadyForPrint(
+        printerType: printerType,
+      );
+
+      if (!printerReady) {
+        _showMessage(
+            '$printerLabel printer is not ready. Please connect it first.');
+        return;
+      }
+
+      // Get test text
+      final testText = _testPrinterTextController.text.trim();
+      if (testText.isEmpty) {
+        _showMessage('Please enter some text to print.');
+        return;
+      }
+
+      // Use different print methods based on selected protocol
+      if (_testPrinterProtocol == 'TSPL') {
+        await _testPrintTSPL(printerType, testText, printerLabel);
+      } else if (_testPrinterProtocol == 'CPCL') {
+        await _testPrintCPCL(printerType, testText, printerLabel);
+      } else {
+        await _testPrintESCPOS(printerType, testText, printerLabel);
+      }
+    } catch (error) {
+      _showMessage('Test print error: ${error.toString()}');
+      debugPrint('Test print error: $error');
+    }
+  }
+
+  Future<void> _testPrintESCPOS(
+    _PrinterType printerType,
+    String testText,
+    String printerLabel,
+  ) async {
+    try {
+      final bytes = <int>[];
+
+      if (_useRawPrintMode && printerType == _PrinterType.label) {
+        // RAW MODE for CT221B - just send plain text with minimal commands
+        debugPrint('===== RAW PRINT MODE FOR CT221B =====');
+        debugPrint('Sending raw text: $testText');
+
+        // Try the absolute minimum - just initialize and send text
+        bytes.addAll([0x1B, 0x40]); // Initialize
+        bytes.addAll(utf8.encode('\n')); // Newline
+        bytes.addAll(utf8.encode('=== RAW TEST ===\n'));
+        bytes.addAll(utf8.encode(testText));
+        bytes.addAll(utf8.encode('\n\n\n\n')); // Feed lines
+
+        debugPrint('Raw bytes: ${bytes.length} bytes');
+      } else {
+        // Standard ESC/POS mode
+        debugPrint('===== Test Print Setup =====');
+        debugPrint('Printer type: $printerLabel');
+        debugPrint('Paper size: $_selectedPaperSize');
+        debugPrint('Test text length: ${testText.length}');
+
+        // Build print bytes
+        final profile = await CapabilityProfile.load();
+        final generator = Generator(_selectedPaperSize, profile);
+
+        // CRITICAL: Add printer initialization for CT221B and similar printers
+        bytes.addAll([
+          0x1B,
+          0x40
+        ]); // ESC @ - Initialize printer (clear buffer, reset settings)
+
+        // For CT221B-76E6 specifically - try waiting and sending wake command
+        if (printerType == _PrinterType.label) {
+          debugPrint('Adding CT221B-specific initialization...');
+          // Some CT-series printers need extra initialization
+          bytes.addAll([0x1B, 0x3D, 0x01]); // ESC = 1 - Select printer online
+          // Try a simple beep to test if printer responds to commands
+          bytes.addAll(
+              [0x1B, 0x42, 0x03, 0x03]); // ESC B n m - Beep (if supported)
+        }
+
+        // Add header
+        bytes.addAll([0x1B, 0x61, 0x01]); // Center align
+        bytes.addAll(
+          generator.text(
+            '=== TEST PRINT ===',
+            styles: const PosStyles(
+              align: PosAlign.center,
+              bold: true,
+              height: PosTextSize.size2,
+              width: PosTextSize.size2,
+            ),
+          ),
+        );
+        bytes.addAll(generator.emptyLines(1));
+
+        // Add printer type label
+        bytes.addAll(
+          generator.text(
+            'Printer: ${printerLabel.toUpperCase()}',
+            styles: const PosStyles(
+              align: PosAlign.center,
+              bold: true,
+            ),
+          ),
+        );
+        bytes.addAll(generator.emptyLines(1));
+
+        // Add test text (split by newlines)
+        bytes.addAll([0x1B, 0x61, 0x00]); // Left align
+        final lines = testText.split('\n');
+        for (final line in lines) {
+          bytes.addAll(
+            generator.text(
+              line,
+              styles: const PosStyles(
+                align: PosAlign.left,
+              ),
+            ),
+          );
+        }
+
+        bytes.addAll(generator.emptyLines(2));
+
+        // Add timestamp
+        final now = DateTime.now();
+        bytes.addAll([0x1B, 0x61, 0x01]); // Center align
+        bytes.addAll(
+          generator.text(
+            'Time: ${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}',
+            styles: const PosStyles(
+              align: PosAlign.center,
+              height: PosTextSize.size1,
+              width: PosTextSize.size1,
+            ),
+          ),
+        );
+
+        bytes.addAll(generator.emptyLines(3)); // More space before cut
+        bytes.addAll(generator.feed(2)); // Explicit feed command
+        bytes.addAll(generator.cut());
+
+        // Add extra feeds after cut to ensure paper advances
+        bytes.addAll([0x1B, 0x64, 0x03]); // ESC d 3 - Feed 3 lines
+
+        debugPrint('Test print bytes prepared: ${bytes.length} bytes');
+      }
+
+      // Send to printer
+      final result = await _writeBytesWithRecovery(
+        bytes,
+        printerType: printerType,
+      );
+
+      if (result) {
+        _showMessage('Test print sent to $printerLabel printer successfully!');
+      } else {
+        _showMessage('Failed to print to $printerLabel printer.');
+      }
+    } catch (error) {
+      _showMessage('Test print error: ${error.toString()}');
+      debugPrint('Test print error: $error');
+    }
+  }
+
+  Future<void> _testPrintTSPL(
+    _PrinterType printerType,
+    String testText,
+    String printerLabel,
+  ) async {
+    try {
+      debugPrint('===== TSPL PRINT MODE =====');
+      debugPrint('Preparing TSPL commands for $printerLabel printer');
+
+      final bytes = <int>[];
+
+      // TSPL commands for label printers
+      // Use smaller label size and offset to prevent blank scrolling
+      bytes.addAll('SIZE 70 mm, 30 mm\r\n'.codeUnits);
+
+      // GAP (distance between labels)
+      bytes.addAll('GAP 2 mm, 0 mm\r\n'.codeUnits);
+
+      // CRITICAL: OFFSET command prevents blank scrolling before print
+      bytes.addAll('OFFSET 0 mm\r\n'.codeUnits);
+
+      // DIRECTION 1 (for normal orientation)
+      bytes.addAll('DIRECTION 1\r\n'.codeUnits);
+
+      // CLS - Clear image buffer
+      bytes.addAll('CLS\r\n'.codeUnits);
+
+      // Set reference point to 0,0 to prevent offset scrolling
+      bytes.addAll('REFERENCE 0,0\r\n'.codeUnits);
+
+      // Set density for better print quality
+      bytes.addAll('DENSITY 8\r\n'.codeUnits);
+
+      // TEXT x, y, "font", rotation, x_scale, y_scale, "content"
+      // Font 3 is common, rotation 0, scale 1x1
+      // Start with moderate top margin
+      bytes.addAll('TEXT 30,20,"4",0,1,2,"TEST PRINT"\r\n'.codeUnits);
+      bytes.addAll('TEXT 30,70,"3",0,1,1,"${DateTime.now()}"\r\n'.codeUnits);
+      bytes.addAll('TEXT 30,105,"3",0,1,1,"$testText"\r\n'.codeUnits);
+
+      // PRINT quantity, copies
+      bytes.addAll('PRINT 1,1\r\n'.codeUnits);
+
+      debugPrint('TSPL commands prepared: ${bytes.length} bytes');
+      debugPrint('Commands: ${String.fromCharCodes(bytes)}');
+
+      // Send to printer
+      final result = await _writeBytesWithRecovery(
+        bytes,
+        printerType: printerType,
+      );
+
+      if (result) {
+        _showMessage(
+            'TSPL test print sent to $printerLabel printer successfully!');
+      } else {
+        _showMessage('Failed to print to $printerLabel printer.');
+      }
+    } catch (error) {
+      _showMessage('TSPL test print error: ${error.toString()}');
+      debugPrint('TSPL test print error: $error');
+    }
+  }
+
+  Future<void> _testPrintCPCL(
+    _PrinterType printerType,
+    String testText,
+    String printerLabel,
+  ) async {
+    try {
+      debugPrint('===== CPCL PRINT MODE =====');
+      debugPrint('Preparing CPCL commands for $printerLabel printer');
+
+      final bytes = <int>[];
+
+      // CPCL commands for label printers
+      // ! offset, height, quantity, media type
+      // 0 = no offset, 200 = height in dots, 200 = width in dots, 1 = quantity
+      bytes.addAll('! 0 200 200 210 1\r\n'.codeUnits);
+
+      // PAGE-WIDTH 576 (for 72mm width at 203dpi)
+      bytes.addAll('PAGE-WIDTH 576\r\n'.codeUnits);
+
+      // TEXT font_id rotation x y text
+      // Font 4 is medium size, rotation 0
+      bytes.addAll('TEXT 4 0 30 40 TEST PRINT\r\n'.codeUnits);
+      bytes.addAll('TEXT 4 0 30 80 ${DateTime.now()}\r\n'.codeUnits);
+      bytes.addAll('TEXT 4 0 30 120 $testText\r\n'.codeUnits);
+
+      // FORM - end of label formatting
+      bytes.addAll('FORM\r\n'.codeUnits);
+
+      // PRINT - print the label
+      bytes.addAll('PRINT\r\n'.codeUnits);
+
+      debugPrint('CPCL commands prepared: ${bytes.length} bytes');
+      debugPrint('Commands: ${String.fromCharCodes(bytes)}');
+
+      // Send to printer
+      final result = await _writeBytesWithRecovery(
+        bytes,
+        printerType: printerType,
+      );
+
+      if (result) {
+        _showMessage(
+            'CPCL test print sent to $printerLabel printer successfully!');
+      } else {
+        _showMessage('Failed to print to $printerLabel printer.');
+      }
+    } catch (error) {
+      _showMessage('CPCL test print error: ${error.toString()}');
+      debugPrint('CPCL test print error: $error');
+    }
+  }
+
   Widget _buildSettingsTab() {
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -2773,57 +3358,261 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
               labelText: 'WiFi Password (optional)',
             ),
           ),
-          const SizedBox(height: 8),
-          DropdownButtonFormField<BluetoothInfo>(
-            isExpanded: true,
-            value: _resolveBluetoothSelection(_selectedPrinter, _pairedDevices),
-            items: _pairedDevices
-                .map(
-                  (d) => DropdownMenuItem<BluetoothInfo>(
-                    value: d,
-                    child: Text(
-                      '${d.name} (${d.macAdress})',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+          const SizedBox(height: 16),
+          // INVOICE PRINTER SECTION
+          Card(
+            color: Colors.blue.shade50,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.receipt_long, color: Colors.blue.shade700),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Invoice Printer',
+                        style:
+                            Theme.of(context).textTheme.titleMedium?.copyWith(
+                                  color: Colors.blue.shade900,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<BluetoothInfo>(
+                    isExpanded: true,
+                    value: _resolveBluetoothSelection(
+                        _invoiceSelectedPrinter, _invoicePairedDevices),
+                    items: _invoicePairedDevices
+                        .map(
+                          (d) => DropdownMenuItem<BluetoothInfo>(
+                            value: d,
+                            child: Text(
+                              '${d.name} (${d.macAdress})',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                    selectedItemBuilder: (context) => _invoicePairedDevices
+                        .map(
+                          (d) => Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              '${d.name} (${d.macAdress})',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                    onChanged: (value) =>
+                        setState(() => _invoiceSelectedPrinter = value),
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      labelText: 'Select invoice printer',
+                      filled: true,
+                      fillColor: Colors.white,
                     ),
                   ),
-                )
-                .toList(),
-            selectedItemBuilder: (context) => _pairedDevices
-                .map(
-                  (d) => Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text(
-                      '${d.name} (${d.macAdress})',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: _isBluetoothConnected(_PrinterType.invoice)
+                              ? null
+                              : () => _connectBluetoothPrinter(
+                                  _PrinterType.invoice,
+                                  showMessage: true),
+                          icon: const Icon(Icons.link),
+                          label: const Text('Connect'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _isBluetoothConnected(_PrinterType.invoice)
+                              ? () => _disconnectBluetoothPrinter(
+                                  _PrinterType.invoice,
+                                  showMessage: true)
+                              : null,
+                          icon: const Icon(Icons.link_off),
+                          label: const Text('Disconnect'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: _isBluetoothConnected(_PrinterType.invoice)
+                          ? Colors.green.shade100
+                          : Colors.grey.shade200,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          _isBluetoothConnected(_PrinterType.invoice)
+                              ? Icons.check_circle
+                              : Icons.cancel,
+                          size: 16,
+                          color: _isBluetoothConnected(_PrinterType.invoice)
+                              ? Colors.green.shade700
+                              : Colors.grey.shade600,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          _isBluetoothConnected(_PrinterType.invoice)
+                              ? 'Connected'
+                              : 'Not connected',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: _isBluetoothConnected(_PrinterType.invoice)
+                                ? Colors.green.shade900
+                                : Colors.grey.shade700,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                )
-                .toList(),
-            onChanged: (value) => setState(() => _selectedPrinter = value),
-            decoration: const InputDecoration(
-              border: OutlineInputBorder(),
-              labelText: 'Paired printer',
+                ],
+              ),
             ),
           ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Expanded(
-                child: FilledButton(
-                  onPressed: _isPrinterConnected ? null : _connectPrinter,
-                  child: const Text('Connect'),
-                ),
+          const SizedBox(height: 16),
+          // LABEL PRINTER SECTION
+          Card(
+            color: Colors.orange.shade50,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.local_offer, color: Colors.orange.shade700),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Label Printer (Bar/Kitchen)',
+                        style:
+                            Theme.of(context).textTheme.titleMedium?.copyWith(
+                                  color: Colors.orange.shade900,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<BluetoothInfo>(
+                    isExpanded: true,
+                    value: _resolveBluetoothSelection(
+                        _labelSelectedPrinter, _labelPairedDevices),
+                    items: _labelPairedDevices
+                        .map(
+                          (d) => DropdownMenuItem<BluetoothInfo>(
+                            value: d,
+                            child: Text(
+                              '${d.name} (${d.macAdress})',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                    selectedItemBuilder: (context) => _labelPairedDevices
+                        .map(
+                          (d) => Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              '${d.name} (${d.macAdress})',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                    onChanged: (value) =>
+                        setState(() => _labelSelectedPrinter = value),
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      labelText: 'Select label printer',
+                      filled: true,
+                      fillColor: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: _isBluetoothConnected(_PrinterType.label)
+                              ? null
+                              : () => _connectBluetoothPrinter(
+                                  _PrinterType.label,
+                                  showMessage: true),
+                          icon: const Icon(Icons.link),
+                          label: const Text('Connect'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _isBluetoothConnected(_PrinterType.label)
+                              ? () => _disconnectBluetoothPrinter(
+                                  _PrinterType.label,
+                                  showMessage: true)
+                              : null,
+                          icon: const Icon(Icons.link_off),
+                          label: const Text('Disconnect'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: _isBluetoothConnected(_PrinterType.label)
+                          ? Colors.green.shade100
+                          : Colors.grey.shade200,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          _isBluetoothConnected(_PrinterType.label)
+                              ? Icons.check_circle
+                              : Icons.cancel,
+                          size: 16,
+                          color: _isBluetoothConnected(_PrinterType.label)
+                              ? Colors.green.shade700
+                              : Colors.grey.shade600,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          _isBluetoothConnected(_PrinterType.label)
+                              ? 'Connected'
+                              : 'Not connected',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: _isBluetoothConnected(_PrinterType.label)
+                                ? Colors.green.shade900
+                                : Colors.grey.shade700,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: OutlinedButton(
-                  onPressed: _isPrinterConnected ? _disconnectPrinter : null,
-                  child: const Text('Disconnect'),
-                ),
-              ),
-            ],
+            ),
           ),
         ] else ...[
           if (_isUsbScanInProgress)
@@ -3463,6 +4252,333 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
     );
   }
 
+  Widget _buildPrinterTestTab() {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text(
+          'Test Printer',
+          style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          'Enter test text below and print to invoice or label printer to verify connections.',
+          style: TextStyle(color: Colors.grey),
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _testPrinterTextController,
+          maxLines: 10,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            labelText: 'Test Text',
+            hintText: 'Enter text to print...',
+            alignLabelWithHint: true,
+          ),
+        ),
+        const SizedBox(height: 16),
+
+        // Protocol Selector
+        const Text(
+          'Printer Protocol',
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          'Select the command protocol for your label printer. Try different protocols if one doesn\'t work.',
+          style: TextStyle(color: Colors.grey, fontSize: 12),
+        ),
+        const SizedBox(height: 8),
+        SegmentedButton<String>(
+          segments: const [
+            ButtonSegment(
+              value: 'ESCPOS',
+              label: Text('ESC/POS'),
+              icon: Icon(Icons.print),
+            ),
+            ButtonSegment(
+              value: 'TSPL',
+              label: Text('TSPL'),
+              icon: Icon(Icons.label),
+            ),
+            ButtonSegment(
+              value: 'CPCL',
+              label: Text('CPCL'),
+              icon: Icon(Icons.qr_code),
+            ),
+          ],
+          selected: {_testPrinterProtocol},
+          onSelectionChanged: (Set<String> newSelection) {
+            setState(() {
+              _testPrinterProtocol = newSelection.first;
+            });
+          },
+        ),
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.amber.shade50,
+            border: Border.all(color: Colors.amber.shade300),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            children: [
+              Icon(Icons.info_outline, color: Colors.amber.shade700, size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  _testPrinterProtocol == 'ESCPOS'
+                      ? 'ESC/POS: Standard thermal printer protocol (most common)'
+                      : _testPrinterProtocol == 'TSPL'
+                          ? 'TSPL: TSC Printer Language (common for label printers like CT series)'
+                          : 'CPCL: Common Printer Command Language (alternative for label printers)',
+                  style: TextStyle(color: Colors.amber.shade900, fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        const Divider(),
+        const SizedBox(height: 16),
+
+        // INVOICE PRINTER TEST
+        Card(
+          color: Colors.blue.shade50,
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.receipt_long,
+                        color: Colors.blue.shade700, size: 32),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Invoice Printer',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.blue.shade900,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            _invoiceSelectedPrinter?.name ?? 'Not selected',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Colors.blue.shade700,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: _isBluetoothConnected(_PrinterType.invoice)
+                        ? Colors.green.shade100
+                        : Colors.grey.shade200,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        _isBluetoothConnected(_PrinterType.invoice)
+                            ? Icons.check_circle
+                            : Icons.cancel,
+                        size: 16,
+                        color: _isBluetoothConnected(_PrinterType.invoice)
+                            ? Colors.green.shade700
+                            : Colors.grey.shade600,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        _isBluetoothConnected(_PrinterType.invoice)
+                            ? 'Connected'
+                            : 'Not connected',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: _isBluetoothConnected(_PrinterType.invoice)
+                              ? Colors.green.shade900
+                              : Colors.grey.shade700,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed: () => _testPrint(_PrinterType.invoice),
+                  icon: const Icon(Icons.print),
+                  label: const Text('Test Print Invoice Printer'),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.all(16),
+                    backgroundColor: Colors.blue.shade700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        const SizedBox(height: 16),
+
+        // LABEL PRINTER TEST
+        Card(
+          color: Colors.orange.shade50,
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.local_offer,
+                        color: Colors.orange.shade700, size: 32),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Label Printer',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.orange.shade900,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            _labelSelectedPrinter?.name ?? 'Not selected',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Colors.orange.shade700,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: _isBluetoothConnected(_PrinterType.label)
+                        ? Colors.green.shade100
+                        : Colors.grey.shade200,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        _isBluetoothConnected(_PrinterType.label)
+                            ? Icons.check_circle
+                            : Icons.cancel,
+                        size: 16,
+                        color: _isBluetoothConnected(_PrinterType.label)
+                            ? Colors.green.shade700
+                            : Colors.grey.shade600,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        _isBluetoothConnected(_PrinterType.label)
+                            ? 'Connected'
+                            : 'Not connected',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: _isBluetoothConnected(_PrinterType.label)
+                              ? Colors.green.shade900
+                              : Colors.grey.shade700,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed: () => _testPrint(_PrinterType.label),
+                  icon: const Icon(Icons.print),
+                  label: const Text('Test Print Label Printer'),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.all(16),
+                    backgroundColor: Colors.orange.shade700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        const SizedBox(height: 24),
+        const Divider(),
+        const SizedBox(height: 16),
+
+        // INSTRUCTIONS
+        Card(
+          color: Colors.grey.shade100,
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.info_outline, color: Colors.grey.shade700),
+                    const SizedBox(width: 8),
+                    const Text(
+                      'How to test',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                const Text('1. Connect printers in Settings tab'),
+                const SizedBox(height: 4),
+                const Text('2. Enter test text above'),
+                const SizedBox(height: 4),
+                const Text('3. Tap "Test Print" for each printer'),
+                const SizedBox(height: 4),
+                const Text('4. Check if text prints correctly'),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.shade50,
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: Colors.blue.shade200),
+                  ),
+                  child: const Text(
+                    'Tip: Use different test text for each printer to verify which printer is which!',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildSalesTab() {
     final pricingSummary = _currentPricingSummary;
     final promoBreakdownNotes =
@@ -3750,7 +4866,7 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 6,
+      length: 7,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Simple Bluetooth POS'),
@@ -3769,6 +4885,7 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
             },
             tabs: const [
               Tab(text: 'Settings', icon: Icon(Icons.settings)),
+              Tab(text: 'Printer Test', icon: Icon(Icons.print)),
               Tab(text: 'Sync Exports', icon: Icon(Icons.table_chart_outlined)),
               Tab(text: 'Catalog', icon: Icon(Icons.inventory_2_outlined)),
               Tab(text: 'Promo', icon: Icon(Icons.discount_outlined)),
@@ -3780,6 +4897,7 @@ class _PosHomePageState extends State<PosHomePage> with WidgetsBindingObserver {
         body: TabBarView(
           children: [
             _buildSettingsTab(),
+            _buildPrinterTestTab(),
             _buildSyncExportsTab(),
             _buildCatalogTab(),
             _buildPromoTab(),
